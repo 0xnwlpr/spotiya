@@ -27,6 +27,8 @@ pub struct Status {
     pub connected: bool,
     pub voice: bool,
     pub native_guard: bool,
+    pub spectrum: bool,
+    pub spectrum_supported: bool,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -43,6 +45,8 @@ pub fn parse(line: &str) -> Option<Intent> {
         "PREVIOUS" => Some(Intent::Previous),
         "VOICE ON" => Some(Intent::Voice(true)),
         "VOICE OFF" => Some(Intent::Voice(false)),
+        "SPECTRUM ON" => Some(Intent::Spectrum(true)),
+        "SPECTRUM OFF" => Some(Intent::Spectrum(false)),
         "RELEASE" => Some(Intent::Release),
         s => {
             if let Some(n) = s.strip_prefix("VOLUME ") {
@@ -63,6 +67,7 @@ pub async fn serve(
     sender: mpsc::Sender<Event>,
     logins: mpsc::Sender<auth::Login>,
     config: SessionConfig,
+    spectrum_supported: bool,
 ) -> io::Result<()> {
     let _ = fs::remove_file(voice::CONTROL);
     let listener = UnixListener::bind(voice::CONTROL)?;
@@ -97,7 +102,9 @@ pub async fn serve(
             let reply = if line.trim() == "STATUS" {
                 fs::read_to_string(STATUS).unwrap_or_else(|_| "ERROR Status unavailable\n".into())
             } else if let Some(intent) = parse(&line) {
-                if sender
+                if matches!(intent, Intent::Spectrum(_)) && !spectrum_supported {
+                    "ERROR Spectrum display is unavailable on this device\n".into()
+                } else if sender
                     .try_send(Event {
                         intent,
                         received: Instant::now(),
@@ -168,5 +175,8 @@ mod tests {
         assert_eq!(parse("PLAY a\nPAUSE"), None);
         assert_eq!(parse("PLAY "), None);
         assert_eq!(parse("VOICE OFF"), Some(Intent::Voice(false)));
+        assert_eq!(parse("SPECTRUM ON"), Some(Intent::Spectrum(true)));
+        assert_eq!(parse("SPECTRUM OFF"), Some(Intent::Spectrum(false)));
+        assert_eq!(parse("SPECTRUM 1"), None);
     }
 }

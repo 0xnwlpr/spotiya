@@ -44,14 +44,14 @@ def main():
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "release", "start", "stop", "restart", "version"))
+        "previous", "volume", "voice", "spectrum", "release", "start", "stop", "restart", "version"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
     if args.command == "play":
         if not args.value:
             parser.error("play needs a song or artist")
         value = [" ".join(args.value)]
-    elif args.command in ("volume", "voice"):
+    elif args.command in ("volume", "voice", "spectrum"):
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
         value = args.value

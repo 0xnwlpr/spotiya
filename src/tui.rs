@@ -103,6 +103,16 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
             "Volume {:3}%   Voice {}   Audio: {}",
             status.volume, voice, guard
         ),
+        format!(
+            "Spectrum: {}",
+            if !status.spectrum_supported {
+                "unavailable"
+            } else if status.spectrum {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         String::new(),
         safe(if status.title.is_empty() {
             "No track selected"
@@ -120,7 +130,7 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         ),
         String::new(),
         "Space pause/play   n next   p previous   +/- volume".into(),
-        "/ search   l login by code   v voice on/off".into(),
+        "/ search   l login   v voice   e spectrum on/off".into(),
         "x release to Alice   q quit".into(),
         String::new(),
     ];
@@ -236,6 +246,17 @@ pub fn run() -> io::Result<()> {
                 b'+' | b'=' => Some(format!("VOLUME {}", (status.volume + 5).min(100))),
                 b'-' => Some(format!("VOLUME {}", status.volume.saturating_sub(5))),
                 b'v' => Some(format!("VOICE {}", if status.voice { "OFF" } else { "ON" })),
+                b'e' => {
+                    if status.spectrum_supported {
+                        Some(format!(
+                            "SPECTRUM {}",
+                            if status.spectrum { "OFF" } else { "ON" }
+                        ))
+                    } else {
+                        notice = "Spectrum display is unavailable on this device".into();
+                        None
+                    }
+                }
                 b'x' => Some("RELEASE".to_owned()),
                 b'/' => {
                     prompt = Some(Vec::new());
@@ -290,6 +311,22 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spectrum_state_is_visible_for_supported_and_other_devices() {
+        let mut status = Status::default();
+        assert!(
+            lines(&status, "", None, 80)
+                .iter()
+                .any(|s| s == "Spectrum: unavailable")
+        );
+        status.spectrum_supported = true;
+        for (enabled, label) in [(false, "off"), (true, "on")] {
+            status.spectrum = enabled;
+            let frame = lines(&status, "", None, 80);
+            assert!(frame.iter().any(|s| s == &format!("Spectrum: {label}")));
+            assert!(frame.iter().any(|s| s.contains("e spectrum on/off")));
+        }
+    }
     #[test]
     fn metadata_cannot_inject_terminal_controls_and_empty_progress_is_safe() {
         assert_eq!(safe("Song\x1b[2J\r\n"), "Song[2J");

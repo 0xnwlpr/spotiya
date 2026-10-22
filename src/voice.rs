@@ -20,6 +20,7 @@ pub enum Intent {
     Toggle,
     Volume(u16),
     Voice(bool),
+    Spectrum(bool),
     Release,
 }
 pub struct Event {

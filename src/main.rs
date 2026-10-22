@@ -35,6 +35,7 @@ mod audio_guard;
 mod auth;
 mod control;
 mod device;
+mod spectrum;
 mod tui;
 mod voice;
 
@@ -48,6 +49,7 @@ struct Shared {
     paused: AtomicBool,
     volume: AtomicU16,
     commands: mpsc::UnboundedSender<Command>,
+    spectrum: Arc<spectrum::Spectrum>,
 }
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
@@ -76,6 +78,27 @@ pub unsafe extern "C" fn mini2_receiver_status(paused: *mut i32, volume: *mut i3
         *volume = percent(s.volume.load(Ordering::Relaxed)) as i32;
     }
     s.active.load(Ordering::Acquire) as i32
+}
+/// # Safety
+/// A non-null `levels` must reference four writable bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mini2_receiver_spectrum(levels: *mut u8) -> i32 {
+    if levels.is_null() {
+        return 0;
+    }
+    let Some(shared) = SHARED.get() else {
+        return 0;
+    };
+    if !shared.active.load(Ordering::Acquire) || shared.paused.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let Some(frame) = shared.spectrum.frame() else {
+        return 0;
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(frame.as_ptr(), levels, frame.len());
+    }
+    1
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn mini2_receiver_command(action: i32) -> i32 {
@@ -191,7 +214,7 @@ fn options() -> Result<Option<Options>, String> {
                 return Err("Pairing connection closed before login completed".into());
             }
             "--play" | "--resume" | "--pause" | "--next" | "--previous" | "--toggle"
-            | "--volume" | "--voice" | "--release" => {
+            | "--volume" | "--voice" | "--spectrum" | "--release" => {
                 let command = match arg.as_str() {
                     "--play" => format!("PLAY {}", args.next().ok_or("missing music query")?),
                     "--resume" => "RESUME".to_owned(),
@@ -202,7 +225,8 @@ fn options() -> Result<Option<Options>, String> {
                     "--release" => "RELEASE".to_owned(),
                     "--volume" => format!("VOLUME {}", args.next().ok_or("missing volume 0..100")?),
                     _ => format!(
-                        "VOICE {}",
+                        "{} {}",
+                        arg.trim_start_matches("--").to_uppercase(),
                         args.next().ok_or("missing on/off")?.to_uppercase()
                     ),
                 };
@@ -225,7 +249,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--no-buttons] [--no-voice]\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --release"
+                    "spotiya [--state-dir PATH] [--name NAME] [--no-buttons] [--no-voice]\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release"
                 );
                 return Ok(None);
             }
@@ -251,6 +275,7 @@ fn publish_status(s: &Shared, info: &mut control::Status, last: &mut String) {
     info.active = s.active.load(Ordering::Acquire);
     info.paused = s.paused.load(Ordering::Relaxed);
     info.volume = percent(s.volume.load(Ordering::Relaxed));
+    info.spectrum = s.spectrum.enabled();
     let mut text = serde_json::to_string(info).unwrap();
     text.push('\n');
     if *last == text {
@@ -296,6 +321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && fs::read_to_string(&voice_setting)
             .map(|s| s.trim() != "0")
             .unwrap_or(true);
+    let spectrum_setting = options.state_dir.join("spectrum-enabled");
+    let spectrum_supported = options.buttons && device::mini2_display_available();
+    let spectrum_enabled =
+        spectrum_supported && fs::read_to_string(&spectrum_setting).is_ok_and(|s| s.trim() == "1");
     let last_track_file = options.state_dir.join("last-track");
     let mut last_track = fs::read_to_string(&last_track_file)
         .ok()
@@ -327,6 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paused: AtomicBool::new(false),
         volume: AtomicU16::new(0),
         commands,
+        spectrum: Arc::new(spectrum::Spectrum::new(spectrum_enabled)),
     });
     let _ = SHARED.set(shared.clone());
     let mixer = Arc::new(MasterMixer {
@@ -341,11 +371,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let backend = audio_backend::find(Some("alsa".into())).expect("ALSA compiled");
+    let visual = shared.spectrum.clone();
     let player = Player::new(
         player_config,
         session.clone(),
         mixer.get_soft_volume(),
-        move || backend(Some("default".into()), AudioFormat::S16),
+        move || {
+            Box::new(spectrum::VisualSink::new(
+                backend(Some("default".into()), AudioFormat::S16),
+                visual.clone(),
+            ))
+        },
     );
     let mut events = player.get_player_event_channel();
     let (voice_tx, mut voice_rx) = mpsc::channel(8);
@@ -353,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
     let voice_control = tokio::spawn(async move {
-        if control::serve(voice_tx, login_tx, control_config)
+        if control::serve(voice_tx, login_tx, control_config, spectrum_supported)
             .await
             .is_err()
         {
@@ -390,6 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut info = control::Status {
         name: options.name.clone(),
         voice: voice_enabled,
+        spectrum_supported,
         ..Default::default()
     };
     let mut position_at = Instant::now();
@@ -495,6 +532,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Voice(enabled)=>{
                         if fs::write(&voice_setting,if enabled{"1\n"}else{"0\n"}).is_ok(){voice_enabled=enabled;info.voice=enabled;}
                         else{eprintln!("voice: could not save voice setting");}
+                        continue;
+                    },
+                    voice::Intent::Spectrum(enabled)=>{
+                        if spectrum_supported {
+                            let temp=spectrum_setting.with_extension("new");
+                            if fs::write(&temp,if enabled{"1\n"}else{"0\n"})
+                                .and_then(|_| fs::rename(&temp,&spectrum_setting)).is_ok() {
+                                shared.spectrum.set_enabled(enabled);
+                            } else { eprintln!("display: could not save spectrum setting"); }
+                        }
                         continue;
                     },
                     voice::Intent::Volume(volume)=>{
@@ -614,6 +661,7 @@ mod tests {
             paused: AtomicBool::new(true),
             volume: AtomicU16::new(from_percent(37)),
             commands,
+            spectrum: Arc::new(spectrum::Spectrum::new(false)),
         });
         assert!(SHARED.set(shared.clone()).is_ok());
         assert_eq!(mini2_receiver_command(0), 0);
@@ -630,6 +678,9 @@ mod tests {
             1
         );
         assert_eq!((paused, volume), (1, 37));
+        let mut levels = [0; 4];
+        assert_eq!(unsafe { mini2_receiver_spectrum(std::ptr::null_mut()) }, 0);
+        assert_eq!(unsafe { mini2_receiver_spectrum(levels.as_mut_ptr()) }, 0);
         shared.active.store(false, Ordering::Release);
         shared.running.store(false, Ordering::Release);
         assert_eq!(mini2_receiver_command(3), 0);

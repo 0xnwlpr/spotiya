@@ -29,6 +29,16 @@ static int clock_value(int i) {
     close(fd);
     return value;
 }
+static void clock_frame(const unsigned char *frame) {
+    for (int i = 0; i < DISPLAY_LEDS; i++) {
+        char path[256];
+        clock_path(path, sizeof path, i);
+        int fd = open(path, O_WRONLY);
+        assert(fd >= 0);
+        assert(ring_write(fd, frame[i]));
+        close(fd);
+    }
+}
 static unsigned clock_digit(int place) {
     unsigned mask = 0;
     for (int i = 0; i < 7; i++)
@@ -149,6 +159,57 @@ int main(void) {
     close(native);
     display_tick(&display, 7100000);
     assert(!display.active && clock_value(4) == 33);
+    clock_frame(original);
+    assert(display_is_clock(original));
+    unsigned char invalid[DISPLAY_LEDS];
+    memcpy(invalid, original, sizeof invalid);
+    invalid[0] = 22;
+    assert(!display_is_clock(invalid));
+    const unsigned char levels[] = {0, 35, 65, 100};
+    display_spectrum(&display, levels, 1, 10000000);
+    assert(display.active && display.mode == DISPLAY_SPECTRUM);
+    assert(clock_digit(0) == 0);
+    assert(clock_value(7 + 3) == 22 && clock_value(7 + 0) == 0);
+    assert(clock_value(14 + 6) == 20 && clock_value(14 + 0) == 0);
+    assert(clock_digit(3) == 127);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) <= 32);
+    display_show(&display, 75, 11000000);
+    display_spectrum(&display, levels, 1, 12000000);
+    assert(display.mode == DISPLAY_VOLUME && clock_digit(2) == 7 && clock_digit(3) == 109);
+    display_tick(&display, 13100000);
+    display_spectrum(&display, levels, 1, 13100000);
+    assert(display.mode == DISPLAY_SPECTRUM && clock_digit(3) == 127);
+    display_spectrum(&display, levels, 0, 13200000);
+    assert(!display.active);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == original[i]);
+    display_spectrum(&display, levels, 1, 14000000);
+    unsigned char next_clock[DISPLAY_LEDS] = {0};
+    const unsigned char next_digits[] = {6, 111, 79, 109}; /* 19:35 */
+    for (int i = 0; i < 28; i++)
+        if (next_digits[i / 7] & (1u << (i % 7)))
+            next_clock[i] = 22;
+    clock_frame(next_clock);
+    display_tick(&display, 14100000);
+    assert(!display.active);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == next_clock[i]);
+    display_spectrum(&display, levels, 1, 14200000);
+    assert(!display.active);
+    display_spectrum(&display, levels, 1, 16000000);
+    assert(display.active);
+    const unsigned char silent[] = {0, 0, 0, 0};
+    display_spectrum(&display, silent, 1, 16100000);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == 0);
+    display_spectrum(&display, levels, 0, 16200000);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == next_clock[i]);
+    next_clock[33] = 22;
+    clock_frame(next_clock);
+    display_spectrum(&display, levels, 1, 17000000);
+    assert(!display.active && clock_value(33) == 22);
     for (int i = 0; i < DISPLAY_LEDS; i++) {
         char path[256];
         clock_path(path, sizeof path, i);
@@ -184,6 +245,6 @@ int main(void) {
         assert(!rmdir(path));
     }
     assert(!rmdir(dir));
-    puts("Ring effects, display 0..100, clock restore, colon blink and native preemption passed.");
+    puts("Ring effects, volume/spectrum priority, clock restore and native preemption passed.");
     return 0;
 }

@@ -122,6 +122,7 @@ static int64_t now_us(clockid_t clock) {
 extern int mini2_receiver_status(int *paused, int *volume);
 extern int mini2_receiver_command(int action);
 extern int mini2_receiver_running(void);
+extern int mini2_receiver_spectrum(unsigned char *levels);
 static int spotify_active(void) { return mini2_receiver_status(&current_paused, &current_volume); }
 static int command(enum action a) { return mini2_receiver_command((int)a); }
 static int empty_keys(const unsigned char *keys) {
@@ -243,6 +244,9 @@ int mini2_buttons_run(void) {
         if (wanted) {
             lights_tick(&lights, now_us(CLOCK_MONOTONIC));
             display_tick(&display, now_us(CLOCK_MONOTONIC));
+            unsigned char levels[4] = {0};
+            int spectrum = mini2_receiver_spectrum(levels);
+            display_spectrum(&display, levels, spectrum, now_us(CLOCK_MONOTONIC));
         } else {
             lights_close(&lights, 1);
             display_close(&display);

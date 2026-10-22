@@ -28,6 +28,9 @@ fn usable_name(name: &str) -> Option<String> {
 pub fn mini2_controls_available() -> bool {
     Path::new("/sys/class/leds/mini2:red:ring1").exists()
 }
+pub fn mini2_display_available() -> bool {
+    Path::new("/sys/class/leds/mini2:white:clockA1").exists()
+}
 
 #[cfg(test)]
 mod tests {
