@@ -101,7 +101,18 @@ struct input_event_abi {
 static volatile sig_atomic_t running = 1;
 static int current_paused, current_volume, current_steps = 100;
 static const char *action_names[] = {"playpause", "next", "prev", "volume+", "volume-"};
-static void note(const char *s) { (void)write(STDERR_FILENO, s, strlen(s)); }
+static void note(const char *s) {
+    size_t left = strlen(s);
+    while (left) {
+        ssize_t written = write(STDERR_FILENO, s, left);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return;
+        s += written;
+        left -= (size_t)written;
+    }
+}
 static int64_t now_us(clockid_t clock) {
     struct timespec t;
     if (clock_gettime(clock, &t))
