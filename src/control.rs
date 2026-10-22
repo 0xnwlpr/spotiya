@@ -1,0 +1,172 @@
+use crate::{
+    auth,
+    voice::{self, Event, Intent},
+};
+use librespot::core::config::SessionConfig;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{self, BufRead, Read, Write},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::UnixListener,
+    sync::{Mutex, Semaphore, mpsc},
+    time::Instant,
+};
+
+pub const STATUS: &str = "/run/spotiya.status";
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Status {
+    pub active: bool,
+    pub paused: bool,
+    pub volume: u16,
+    pub connected: bool,
+    pub voice: bool,
+    pub native_guard: bool,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_ms: u32,
+    pub position_ms: u32,
+    pub name: String,
+}
+pub fn parse(line: &str) -> Option<Intent> {
+    match line.trim() {
+        "RESUME" => Some(Intent::Resume),
+        "PAUSE" => Some(Intent::Pause),
+        "TOGGLE" => Some(Intent::Toggle),
+        "NEXT" => Some(Intent::Next),
+        "PREVIOUS" => Some(Intent::Previous),
+        "VOICE ON" => Some(Intent::Voice(true)),
+        "VOICE OFF" => Some(Intent::Voice(false)),
+        "RELEASE" => Some(Intent::Release),
+        s => {
+            if let Some(n) = s.strip_prefix("VOLUME ") {
+                return n
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n <= 100)
+                    .map(Intent::Volume);
+            }
+            s.strip_prefix("PLAY ")
+                .map(str::trim)
+                .filter(|q| !q.is_empty() && q.len() <= 400 && !q.contains(['\n', '\r', '\0']))
+                .map(|q| Intent::Play(q.to_owned()))
+        }
+    }
+}
+pub async fn serve(
+    sender: mpsc::Sender<Event>,
+    logins: mpsc::Sender<auth::Login>,
+    config: SessionConfig,
+) -> io::Result<()> {
+    let _ = fs::remove_file(voice::CONTROL);
+    let listener = UnixListener::bind(voice::CONTROL)?;
+    let limit = Arc::new(Semaphore::new(8));
+    let login_lock = Arc::new(Mutex::new(()));
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let Ok(permit) = limit.clone().try_acquire_owned() else {
+            continue;
+        };
+        let sender = sender.clone();
+        let logins = logins.clone();
+        let config = config.clone();
+        let login_lock = login_lock.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut reader = BufReader::new(socket).take(512);
+            let mut line = String::new();
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await,
+                Ok(Ok(1..))
+            ) || !line.ends_with('\n')
+            {
+                return;
+            }
+            let mut socket = reader.into_inner().into_inner();
+            if line.trim() == "LOGIN" {
+                let (r, w) = socket.into_split();
+                auth::serve(r, w, login_lock, config, logins).await;
+                return;
+            }
+            let reply = if line.trim() == "STATUS" {
+                fs::read_to_string(STATUS).unwrap_or_else(|_| "ERROR Status unavailable\n".into())
+            } else if let Some(intent) = parse(&line) {
+                if sender
+                    .try_send(Event {
+                        intent,
+                        received: Instant::now(),
+                        from_voice: false,
+                    })
+                    .is_ok()
+                {
+                    "OK\n".into()
+                } else {
+                    "BUSY\n".into()
+                }
+            } else {
+                "INVALID\n".into()
+            };
+            let _ = socket.write_all(reply.as_bytes()).await;
+        });
+    }
+}
+pub fn request(command: &str) -> io::Result<String> {
+    let mut socket = std::os::unix::net::UnixStream::connect(voice::CONTROL)?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    writeln!(socket, "{command}")?;
+    let mut reply = String::new();
+    io::BufReader::new(socket)
+        .take(16384)
+        .read_line(&mut reply)?;
+    if reply.trim().is_empty()
+        || reply.starts_with("ERROR")
+        || matches!(reply.trim(), "BUSY" | "INVALID")
+    {
+        return Err(io::Error::other(reply.trim().to_owned()));
+    }
+    Ok(reply)
+}
+// The caller owns the reader, so closing it cancels a pending device login.
+pub fn login() -> io::Result<io::BufReader<std::os::unix::net::UnixStream>> {
+    let mut socket = std::os::unix::net::UnixStream::connect(voice::CONTROL)?;
+    socket.set_read_timeout(Some(Duration::from_secs(660)))?;
+    writeln!(socket, "LOGIN")?;
+    Ok(io::BufReader::new(socket))
+}
+pub fn login_line(line: &str) -> String {
+    if let Some(json) = line.strip_prefix("CODE ")
+        && let Ok(code) = serde_json::from_str::<serde_json::Value>(json)
+    {
+        return format!(
+            "Open {}\nCode: {}\nWaiting for approval... (Ctrl+C cancels)",
+            code["url"].as_str().unwrap_or("https://spotify.com/pair"),
+            code["code"].as_str().unwrap_or("?")
+        );
+    }
+    line.trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_local_commands_and_volume_bounds() {
+        assert_eq!(parse("VOLUME 100\n"), Some(Intent::Volume(100)));
+        assert_eq!(parse("VOLUME 101"), None);
+        assert_eq!(parse("VOLUME -1"), None);
+        assert_eq!(
+            parse("PLAY no surprises\n"),
+            Some(Intent::Play("no surprises".into()))
+        );
+        assert_eq!(parse("PLAY a\nPAUSE"), None);
+        assert_eq!(parse("PLAY "), None);
+        assert_eq!(parse("VOICE OFF"), Some(Intent::Voice(false)));
+    }
+}

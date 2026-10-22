@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""spotiya: launch the receiver terminal tools over ADB."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+
+BASE = "/data/opt/spotify-connect"
+
+
+def configured_device():
+    explicit = os.environ.get("SPOTIYA_DEVICE") or os.environ.get("MINI2_DEVICE")
+    if explicit:
+        return explicit
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "spotiya" / "config.json"
+    try:
+        value = json.loads(config.read_text()).get("device")
+        return value if isinstance(value, str) and value else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def select_device(parser, explicit):
+    if explicit:
+        return explicit
+    result = subprocess.run(["adb", "devices"], text=True, capture_output=True)
+    if result.returncode:
+        parser.error(result.stderr.strip() or "adb devices failed")
+    devices = [fields[0] for line in result.stdout.splitlines()
+               if len(fields := line.split()) == 2 and fields[1] == "device"]
+    if len(devices) == 1:
+        return devices[0]
+    parser.error("Choose an ADB device with --device or SPOTIYA_DEVICE; connected: " + (", ".join(devices) or "none"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="spotiya: terminal controls over ADB")
+    parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
+    parser.add_argument("command", nargs="?", default="tui", choices=(
+        "tui", "login", "status", "play", "pause", "resume", "toggle", "next",
+        "previous", "volume", "voice", "release", "start", "stop", "restart", "version"))
+    parser.add_argument("value", nargs="*")
+    args = parser.parse_args()
+    if args.command == "play":
+        if not args.value:
+            parser.error("play needs a song or artist")
+        value = [" ".join(args.value)]
+    elif args.command in ("volume", "voice"):
+        if len(args.value) != 1:
+            parser.error(args.command + " needs one value")
+        value = args.value
+    else:
+        if args.value:
+            parser.error("unexpected arguments")
+        value = []
+    adb = ["adb", "-s", select_device(parser, args.device)]
+    if args.command in ("start", "stop", "restart"):
+        os.execvp("adb", adb + ["shell", shlex.join(["/etc/init.d/S99spotify-connect", args.command])])
+    if args.command == "tui" and not sys.stdin.isatty():
+        parser.error("tui needs an interactive terminal")
+    if args.command not in ("status", "version"):
+        start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
+            sys.exit(start.stdout.strip() or "Unable to start receiver")
+    remote = shlex.join([BASE + "/spotiya", "--" + args.command] + value)
+    if args.command == "tui":
+        columns, rows = shutil.get_terminal_size(fallback=(80, 24))
+        remote = f"stty rows {rows} cols {columns}; exec " + remote
+    flags = ["-t"] if args.command == "tui" else []
+    if args.command == "tui":
+        saved = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setraw(sys.stdin)
+            return subprocess.call(adb + ["shell"] + flags + [remote])
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+    os.execvp("adb", adb + ["shell"] + flags + [remote])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

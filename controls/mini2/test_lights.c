@@ -1,0 +1,189 @@
+#define _POSIX_C_SOURCE 200809L
+#define BUTTON_TEST
+#include "buttons.c"
+#include <assert.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static char test_root[128];
+#define LED_ROOT test_root
+#include "lights.h"
+#include "display.h"
+static void clock_path(char *path, size_t size, int i) {
+    static const char *extra[] = {"PLUS1", "PLUS2", "PLUS3", "PLUS4", "MINUS", "DEGREE"};
+    if (i < 28)
+        snprintf(path, size, "%smini2:white:clock%c%d/brightness", test_root, 'A' + i % 7,
+                 i / 7 + 1);
+    else
+        snprintf(path, size, "%smini2:white:clock%s/brightness", test_root, extra[i - 28]);
+}
+static int clock_value(int i) {
+    char path[256];
+    clock_path(path, sizeof path, i);
+    int fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+    int value = ring_read(fd);
+    close(fd);
+    return value;
+}
+static unsigned clock_digit(int place) {
+    unsigned mask = 0;
+    for (int i = 0; i < 7; i++)
+        if (clock_value(place * 7 + i))
+            mask |= 1u << i;
+    return mask;
+}
+static void path_for(char *path, size_t size, int i) {
+    const char *color = i < 6 ? "red" : i < 12 ? "green" : "blue";
+    snprintf(path, size, "%smini2:%s:ring%d/brightness", test_root, color, i % 6 + 1);
+}
+static int brightness(int i) {
+    char path[256];
+    path_for(path, sizeof path, i);
+    int fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+    int value = ring_read(fd);
+    close(fd);
+    return value;
+}
+static void native_frame(int value) {
+    for (int i = 0; i < 18; i++) {
+        char path[256];
+        path_for(path, sizeof path, i);
+        int fd = open(path, O_WRONLY);
+        assert(fd >= 0);
+        assert(ring_write(fd, value));
+        close(fd);
+    }
+}
+int main(void) {
+    char temp[] = "/tmp/spotify-ring-test-XXXXXX";
+    char *dir = mkdtemp(temp);
+    assert(dir);
+    snprintf(test_root, sizeof test_root, "%s/", dir);
+    for (int i = 0; i < 18; i++) {
+        char path[256];
+        path_for(path, sizeof path, i);
+        char *slash = strrchr(path, '/');
+        *slash = 0;
+        assert(!mkdir(path, 0700));
+        *slash = '/';
+        int fd = open(path, O_CREAT | O_RDWR, 0600);
+        assert(fd >= 0);
+        assert(ring_write(fd, 0));
+        close(fd);
+    }
+    struct gesture gesture = {0};
+    key_event(&gesture, 582, 1, 1);
+    struct lights l = {0};
+    lights_begin(&l, TOGGLE, 0, 50, 100, 1000000);
+    assert(l.active);
+    lights_tick(&l, 1060000);
+    assert(brightness(6) == 80 && brightness(0) < 10);
+    lights_tick(&l, 1400000);
+    assert(!l.active);
+    for (int i = 0; i < 18; i++)
+        assert(brightness(i) == 0);
+    lights_begin(&l, TOGGLE, 1, 50, 100, 2000000);
+    lights_tick(&l, 2060000);
+    assert(brightness(0) == 80 && brightness(6) == 26);
+    lights_close(&l, 1);
+    assert(brightness(0) == 0);
+    lights_begin(&l, LOUDER, 0, 50, 100, 3000000);
+    lights_tick(&l, 3060000);
+    assert(brightness(6) == 80 && brightness(8) == 80 && brightness(9) == 0);
+    lights_close(&l, 1);
+    const unsigned char original_digits[] = {6, 91, 79, 102}; /* 12:34 */
+    unsigned char original[DISPLAY_LEDS] = {0};
+    for (int i = 0; i < 28; i++)
+        if (original_digits[i / 7] & (1u << (i % 7)))
+            original[i] = 22;
+    original[28] = original[29] = 22;
+    for (int i = 0; i < DISPLAY_LEDS; i++) {
+        char path[256];
+        clock_path(path, sizeof path, i);
+        char *slash = strrchr(path, '/');
+        *slash = 0;
+        assert(!mkdir(path, 0700));
+        *slash = '/';
+        int fd = open(path, O_CREAT | O_RDWR, 0600);
+        assert(fd >= 0);
+        assert(ring_write(fd, original[i]));
+        close(fd);
+    }
+    struct display display = {0};
+    display_show(&display, 75, 1000000);
+    assert(display.active);
+    assert(!clock_digit(0) && !clock_digit(1) && clock_digit(2) == 7 && clock_digit(3) == 109);
+    assert(clock_value(28) == 0 && clock_value(29) == 0);
+    char colon_path[256];
+    clock_path(colon_path, sizeof colon_path, 28);
+    int colon = open(colon_path, O_RDWR);
+    assert(colon >= 0);
+    assert(ring_write(colon, 22));
+    close(colon);
+    display_tick(&display, 2000000);
+    assert(display.active && clock_value(28) == 0);
+    display_tick(&display, 3100000);
+    assert(!display.active);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == original[i]);
+    display_show(&display, 0, 4000000);
+    assert(clock_digit(3) == 63 && !clock_digit(2));
+    display_show(&display, 100, 5000000);
+    assert(clock_digit(1) == 6 && clock_digit(2) == 63 && clock_digit(3) == 63);
+    display_tick(&display, 6100000);
+    assert(display.active); /* timeout extended */
+    display_close(&display);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == original[i]);
+    display_show(&display, 57, 7000000);
+    char native_path[256];
+    clock_path(native_path, sizeof native_path, 4);
+    int native = open(native_path, O_RDWR);
+    assert(native >= 0);
+    assert(ring_write(native, 33));
+    close(native);
+    display_tick(&display, 7100000);
+    assert(!display.active && clock_value(4) == 33);
+    for (int i = 0; i < DISPLAY_LEDS; i++) {
+        char path[256];
+        clock_path(path, sizeof path, i);
+        assert(!unlink(path));
+        *strrchr(path, '/') = 0;
+        assert(!rmdir(path));
+    }
+    lights_begin(&l, NEXT, 0, 50, 100, 4000000);
+    lights_tick(&l, 4160000);
+    assert(brightness(8) == 80 && brightness(7) == 24 && brightness(6) == 5);
+    lights_begin(&l, PREV, 0, 50, 100, 4200000);
+    lights_tick(&l, 4360000);
+    assert(brightness(9) == 80 && brightness(10) == 24 && brightness(11) == 5);
+    native_frame(17);
+    lights_tick(&l, 4390000);
+    assert(!l.active);
+    for (int i = 0; i < 18; i++)
+        assert(brightness(i) == 17);
+    lights_begin(&l, TOGGLE, 0, 50, 100, 6000000);
+    assert(!l.active);
+    for (int i = 0; i < 18; i++)
+        assert(brightness(i) == 17);
+    native_frame(0);
+    lights_begin(&l, QUIETER, 0, 0, 100, 7000000);
+    lights_tick(&l, 7060000);
+    assert(l.active && brightness(0) > 0 && brightness(6) == 0);
+    lights_close(&l, 1);
+    for (int i = 0; i < 18; i++) {
+        char path[256];
+        path_for(path, sizeof path, i);
+        assert(!unlink(path));
+        *strrchr(path, '/') = 0;
+        assert(!rmdir(path));
+    }
+    assert(!rmdir(dir));
+    puts("Ring effects, display 0..100, clock restore, colon blink and native preemption passed.");
+    return 0;
+}

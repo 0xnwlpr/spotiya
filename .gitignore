@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.cache/
+__pycache__/
+*.pyc
+*.log
+*.pcap
+.env
+/state/
+/receiver-state/
+/config.json
+/controls/mini2/test-buttons
+/controls/mini2/test-lights
